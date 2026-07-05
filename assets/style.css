@@ -133,6 +133,25 @@ a { color: inherit; text-decoration: none; }
 
 .hero .wrap { position: relative; z-index: 1; }
 
+.hero-layout {
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 24px;
+  align-items: center;
+}
+
+.hero-portrait {
+  justify-self: end;
+  align-self: end;
+}
+
+.hero-portrait img {
+  width: 100%;
+  max-width: 360px;
+  height: auto;
+  filter: drop-shadow(0 30px 60px rgba(0, 0, 0, 0.55));
+}
+
 .hero-eyebrow {
   color: var(--muted);
   font-size: 0.95rem;
@@ -380,12 +399,13 @@ section { padding: 100px 0; }
   border-radius: var(--radius);
   background: linear-gradient(135deg, var(--card), var(--bg-alt));
   border: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--muted);
-  font-family: "Space Grotesk", sans-serif;
-  font-size: 1rem;
+  overflow: hidden;
+}
+
+.about-portrait img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .about-copy p { color: var(--muted); font-size: 1.05rem; margin-bottom: 18px; }
@@ -553,6 +573,9 @@ section { padding: 100px 0; }
   .work-grid { grid-template-columns: repeat(2, 1fr); }
   .services-grid { grid-template-columns: 1fr; }
   .about-grid, .contact-grid { grid-template-columns: 1fr; }
+  .hero-layout { grid-template-columns: 1fr; }
+  .hero-portrait { justify-self: center; order: -1; margin-bottom: 8px; }
+  .hero-portrait img { max-width: 260px; }
 }
 
 @media (max-width: 680px) {
