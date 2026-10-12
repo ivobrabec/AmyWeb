@@ -1,0 +1,75 @@
+# Review každého pull requestu Claudem: správnost (plugin code-review) a
+# bezpečnost (vlastní zadání). Běží z předplatného Claude: secret
+# CLAUDE_CODE_OAUTH_TOKEN vznikne příkazem `claude setup-token`. Komentáře do PR
+# posílá GitHub App Claude (https://github.com/apps/claude), musí být
+# nainstalovaná na repozitáři. Nálezy neblokují merge, jen komentují.
+#
+# Soubor je obecný, bez odkazu na konkrétní projekt: do ostatních repozitářů
+# ho rozkopíruje scripts/claude-review-rollout.sh. Co má review hlídat navíc,
+# patří do CLAUDE.md daného repozitáře.
+name: claude-review
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+  id-token: write
+jobs:
+  code:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
+  security:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR: ${{ github.event.pull_request.number }}
+
+            Proveď bezpečnostní review změn v tomto pull requestu. Diff získáš
+            přes `gh pr diff`, kontext z checkoutu. Řiď se pravidly v CLAUDE.md
+            repozitáře, pokud existuje.
+
+            Hledej jen bezpečnostní chyby, ne styl ani obecnou kvalitu:
+            - injekce (SQL, příkazy shellu, XSS, hlavičky, cesty k souborům),
+            - chybějící nebo obejitelné ověření identity a oprávnění,
+            - únik dat mezi tenanty, uživateli nebo účty,
+            - tajemství v kódu, konfiguraci, logách nebo chybových hláškách,
+            - nebezpečné zacházení s tokeny, cookies, přesměrováním (SSRF, CSRF,
+              open redirect),
+            - nové závislosti nebo oprávnění CI, která rozšiřují útočnou plochu.
+
+            Nález hlas jen tehdy, když umíš popsat skutečnou cestu od vstupu
+            útočníka k dopadu. Každý nález zapiš jako inline komentář nástrojem
+            mcp__github_inline_comment__create_inline_comment na řádek, kde chyba
+            je: závažnost (kritická / vysoká / střední / nízká), co se stane,
+            jak to opravit. Když nic nenajdeš, pošli jeden komentář
+            `gh pr comment` s textem "Bezpečnostní review: bez nálezů."
+            Kód neměň a nic nepushuj.
+          claude_args: |
+            --max-turns 40
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
