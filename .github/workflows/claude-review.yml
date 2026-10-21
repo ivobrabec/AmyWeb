@@ -7,12 +7,32 @@
 # Soubor je obecný, bez odkazu na konkrétní projekt: do ostatních repozitářů
 # ho rozkopíruje scripts/claude-review-rollout.sh. Co má review hlídat navíc,
 # patří do CLAUDE.md daného repozitáře.
+#
+# Ruční spuštění: Actions → claude-review → Run workflow, číslo PR do `pr`.
+# Spouští se z `main` (akce Claude odmítne workflow, které se liší od verze
+# na `main`), review ale čte hlavu zadaného PR. Hodí se, když review spadlo
+# na infrastruktuře a kód se nezměnil; checky u PR tím nezezelenají, ty
+# nese jen běh vyvolaný samotným PR. Bez události pull_request nemá akce
+# kontext PR a nástroj na inline komentáře nemá kam psát, proto job `code`
+# při ručním běhu plugin nechá nálezy vypsat a pošle je jako jeden komentář.
 name: claude-review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Číslo pull requestu, který se má zkontrolovat"
+        required: true
+        type: string
+env:
+  PR: ${{ github.event.pull_request.number || inputs.pr }}
+  # Při ručním spuštění hlava zadaného PR; jinak prázdné, tedy ref události.
+  REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/head', inputs.pr) || '' }}
+# Ruční běh má vlastní skupinu: jinak by zrušil automatický běh téhož PR,
+# nebo ten jeho.
 concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
+  group: claude-review-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pr }}
   cancel-in-progress: true
 permissions:
   contents: read
@@ -21,38 +41,130 @@ permissions:
   id-token: write
 jobs:
   code:
-    if: github.event.pull_request.draft == false
+    # Not on Dependabot's pull requests: they get no repository secrets, so
+    # the review could not sign in and would only fail. CI still checks them.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false && github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-      - uses: anthropics/claude-code-action@v1
+          ref: ${{ env.REF }}
+      # Na události pull_request plugin komentuje inline sám (--comment). Při
+      # ručním běhu se --comment vynechá: plugin pak nálezy jen vypíše a krok
+      # pod tím je pošle do PR jako jeden komentář.
+      #
+      # Nástroje jsou ty, které si plugin sám deklaruje (allowed-tools v
+      # plugins/code-review/commands/code-review.md), až na `gh pr comment`.
+      # Akce je z příkazu nepřebírá: s povoleným jen inline komentářem plugin
+      # nepřečetl PR (`gh pr view` odmítnuto) a skončil bez review.
+      # `gh pr comment` mu chybí schválně a je i výslovně zakázaný
+      # (--disallowedTools): posílá jím jen souhrn „No issues found“ a z každého
+      # komentáře jde e-mail. Review bez nálezů je vidět
+      # na zelené kontrole, nálezy přijdou jako inline komentáře.
+      #
+      # `Task` (v novějších verzích `Agent`) pouští podagenty. Plugin na nich
+      # stojí: kontrola stavu PR, audit proti CLAUDE.md a dvě hledání chyb.
+      # Bez nich review sám přizná „a single reviewer's read, not the full
+      # four-agent pass“ a skončí po dvou, třech krocích.
+      #
+      # A musí běžet v popředí. Claude Code pouští podagenty na pozadí a běh
+      # v Actions skončí s první odpovědí, dřív než se agenti ozvou: jedno
+      # review skončilo větou „Five agents are still running. I'll stop here“
+      # a bez jediného nálezu. CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 vezme
+      # nástrojům volbu běhu na pozadí, takže agenti doběhnou v rámci tahu
+      # (víc najednou v jedné zprávě pořád běží souběžně); věta v zadání to
+      # říká ještě jednou pro případ, že by proměnná nestačila.
+      #
+      # Plugin se zastaví, když už Claude v PR komentoval. Bezpečnostní job
+      # komentuje vždy, takže druhý push i každý ruční běh by skončil hned na
+      # začátku; věta za adresou PR mu to vysvětlí.
+      - id: review
+        uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6 # v1.0.253
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
           plugins: "code-review@claude-code-plugins"
-          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
-          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
+          prompt: >-
+            /code-review:code-review ${{ github.event_name == 'pull_request' && '--comment ' || '' }}${{ github.repository }}/pull/${{ env.PR }}
+            Review the current head even when Claude has already commented on this pull request:
+            the security review's comment and reviews of earlier commits do not count as this review.
+            When nothing is found, post nothing: no summary comment.
+            Run every agent in the foreground and wait for all of them before you finish:
+            this run ends with your last message, and an agent still running then is lost.
+          claude_args: >-
+            --allowedTools "Task,Agent,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),mcp__github_inline_comment__create_inline_comment"
+            --disallowedTools "Bash(gh pr comment:*)"
+      # Co review řeklo, do souhrnu běhu vždy: bez nálezů se do PR nic
+      # neposílá, a bez souhrnu by nešlo poznat, jestli review proběhlo,
+      # nebo skončilo dřív, než PR přečetlo.
+      #
+      # Ruční běh pak nálezy pošle do PR jako jeden komentář. Tokenem
+      # workflow: token aplikace Claude akce na konci svého kroku zneplatní
+      # (krok „Revoke app token“), takže tady by skončil na 401.
+      - name: Summarise the review, and post the findings of a run by hand
+        if: always() && steps.review.outputs.execution_file != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+          BY_HAND: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          body=$(jq -rs '[.[] | (if type=="array" then .[] else . end)]
+                         | map(select(.type=="result")) | last | .result // empty' "$EXECUTION_FILE")
+          turns=$(jq -rs '[.[] | (if type=="array" then .[] else . end)]
+                          | map(select(.type=="result")) | last | .num_turns // "?"' "$EXECUTION_FILE")
+          { echo "## Code review of #${PR} (head $(git rev-parse --short HEAD), ${turns} turns)"; echo
+            if [ -n "$body" ]; then echo "$body"; else echo "_The review produced no text._"; fi
+          } > /tmp/review.md
+          cat /tmp/review.md >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/review.md
+          # Review, které skončilo dřív, než se agenti ozvali, nic nenašlo
+          # jen proto, že nedočetlo. Řečeno nahlas, aby zelená kontrola nelhala.
+          if printf '%s\n' "$body" | grep -Eiq 'agents? (are|is) still running|still running'; then
+            echo "::warning::the review ended with agents still running, so its findings are incomplete"
+          fi
+          [ "$BY_HAND" = "true" ] || exit 0
+          if [ -z "$body" ]; then
+            echo "::warning::the review produced no text to post"
+            exit 0
+          fi
+          # Do PR jen nálezy. Plugin je hlásí řádkem „Found N issues“; cokoli
+          # jiného („No issues found“, „I didn't review PR 30…“ u zavřeného
+          # PR) zůstane v souhrnu běhu a e-mail z toho nechodí.
+          if ! printf '%s\n' "$body" | grep -Eq '^[[:space:]]*Found [0-9]+ issues?'; then
+            echo "::notice::the review reported no findings; nothing posted (see the run summary)"
+            exit 0
+          fi
+          sed -i '1s/.*/## Code review (run by hand, head '"$(git rev-parse --short HEAD)"')/' /tmp/review.md
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file /tmp/review.md
   security:
-    if: github.event.pull_request.draft == false
+    # Not on Dependabot's pull requests: they get no repository secrets, so
+    # the review could not sign in and would only fail. CI still checks them.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false && github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-      - uses: anthropics/claude-code-action@v1
+          ref: ${{ env.REF }}
+      - uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6 # v1.0.253
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             REPO: ${{ github.repository }}
-            PR: ${{ github.event.pull_request.number }}
+            PR: ${{ env.PR }}
 
             Proveď bezpečnostní review změn v tomto pull requestu. Diff získáš
-            přes `gh pr diff`, kontext z checkoutu. Řiď se pravidly v CLAUDE.md
-            repozitáře, pokud existuje.
+            přes `gh pr diff ${{ env.PR }}`, kontext z checkoutu. Řiď se
+            pravidly v CLAUDE.md repozitáře, pokud existuje.
 
             Hledej jen bezpečnostní chyby, ne styl ani obecnou kvalitu:
             - injekce (SQL, příkazy shellu, XSS, hlavičky, cesty k souborům),
@@ -67,9 +179,9 @@ jobs:
             útočníka k dopadu. Každý nález zapiš jako inline komentář nástrojem
             mcp__github_inline_comment__create_inline_comment na řádek, kde chyba
             je: závažnost (kritická / vysoká / střední / nízká), co se stane,
-            jak to opravit. Když nic nenajdeš, pošli jeden komentář
-            `gh pr comment` s textem "Bezpečnostní review: bez nálezů."
-            Kód neměň a nic nepushuj.
+            jak to opravit. Když nic nenajdeš, nic neposílej: žádný souhrnný
+            komentář. Kód neměň a nic nepushuj.
           claude_args: |
             --max-turns 40
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --disallowedTools "Bash(gh pr comment:*)"
