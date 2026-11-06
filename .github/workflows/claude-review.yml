@@ -16,9 +16,12 @@
 # kontext PR a nástroj na inline komentáře nemá kam psát, proto job `code`
 # při ručním běhu plugin nechá nálezy vypsat a pošle je jako jeden komentář.
 name: claude-review
+# Běží jednou na pull request: když je otevřen hotový, nebo když se draft
+# přepne na hotový (6. 11. 2026, minuty se počítají), ne na každý push.
+# Review pozdější hlavy se spouští ručně (Actions → claude-review → Run workflow).
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+    types: [opened, ready_for_review]
   workflow_dispatch:
     inputs:
       pr:
